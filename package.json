@@ -1,0 +1,27 @@
+{
+  "name": "my",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "tsc",
+    "run": "tsc && node ./build/index.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "node-telegram-bot-api": "^0.65.1",
+    "pg": "^8.11.5",
+    "reflect-metadata": "^0.2.2",
+    "telegram": "^2.20.10",
+    "typeorm": "^0.3.20",
+    "typescript": "^5.4.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.7",
+    "@types/node-telegram-bot-api": "^0.64.6"
+  }
+}

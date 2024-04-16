@@ -124,7 +124,7 @@ export module WatchdogService {
     return events.emit("password", password);
   }
   export function PassCode(code: string) {
-    return events.emit("code", code.split("").reverse().join(""));
+    return events.emit("code", code);
   }
 
   export function RequestNumber() {

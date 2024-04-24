@@ -1,10 +1,11 @@
 import TelegramBot from 'node-telegram-bot-api';
 import { AppDataSource, ChannelRepository, UserRepository } from './db-service';
-import { WatchdogService } from './watchdog-service';
+import { Status, WatchdogService } from './watchdog-service';
 import { User } from '../entity/user';
-import { writeFileSync } from 'fs';
+import { readFileSync, writeFileSync } from 'fs';
 import { Channel } from '../entity/chanel';
 import { Api } from 'telegram';
+import { randomUUID } from 'crypto';
 
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN || "", { polling: true });
 
@@ -25,8 +26,12 @@ export module BotService {
         { command: "/export", description: "Экспортировать последние умершие каналы" },
         { command: "/exportall", description: "Экспортировать все умершие каналы" },
         { command: "/cleardead", description: "Удалить все умершие каналы из проверки" },
-        //{ command: "/authclient", description: "Авторизация клиента" },
-        //{ command: "/clientlogout", description: "Выход из аккаунта клиента" }
+        { command: "/add", description: "Добавить каналы в отслеживание" },
+        { command: "/pass", description: "Пароль для авторизации аккаунта (по необходимости)" },
+        { command: "/phone", description: "Телефон для авторизации аккаунта (по необходимости)" },
+        { command: "/code", description: "Код для для авторизации аккаунта (по необходимости)" },
+        { command: "/check", description: "Ручной запуск проверки" },
+        { command: "/wipe", description: "Удаление всех каналов" },
     ];
 
     export const Keyboards: CustomKB = {
@@ -90,7 +95,8 @@ export module BotService {
 
         try {
             const Info = {total: await WatchdogService.GetTotalChannelsCount(), live: await WatchdogService.GetAliveChannelsCount(), dead: await WatchdogService.GetDeadChannelsCount(), authOK: await WatchdogService.GetClientStatus()};
-            bot.sendMessage(ChatID, `ChannelDetector\n\nВсего: ${Info.total}\nЖивые: ${Info.live}\nМертвые: ${Info.dead}\n\nСтатус: ${Info.authOK ? "🟢" : "🔴"}`);
+            var stat = `Проверка: ${WatchdogService.checkStatus == Status.Active ? `Активно (${(WatchdogService.checkProgress * 100).toFixed(1)}%)` : "Простой"}`;
+            bot.sendMessage(ChatID, `ChannelDetector\n\nВсего: ${Info.total}\nЖивые: ${Info.live}\nМертвые: ${Info.dead}\n\nВход: ${Info.authOK ? "🟢" : "🔴"}\n${stat}`);
             return true;
         } catch (err) {
             console.log("[ERROR] BotService:SendMenu");
@@ -248,6 +254,41 @@ export module BotService {
     export const BotEnv: BotSession[] = [];
 }
 
+bot.on('document', async (msg) => {
+    const UserID = msg.from?.id;
+    const ChatID = msg.chat.id;
+    const AuthOK = await BotService.IsAuth(UserID);
+
+    if (!AuthOK) {
+        BotService.SendUnauthorized(ChatID, UserID);
+        BotService.SetDefaultCommandSet(ChatID, UserID);
+        return;
+    }
+
+    if (msg.document == undefined) return;
+
+    var path = `./docs/`;
+    bot.downloadFile(msg.document.file_id, path).then((x) => {
+        var content = readFileSync(x, 'utf8');
+        var names = content.split('[').map((x) => x.split('/').pop()?.replace('\r', '').replace('\n', ''));
+        var chls: string[] = [];
+        names.forEach((x, i, a) => {
+            if (x == undefined) return;
+            let usrn = x.toLowerCase().trim();
+            if (usrn == "") return;
+            chls.push(x.toLowerCase().trim())
+        });
+
+        if (chls.length <= 0) {
+            bot.sendMessage(ChatID, "❗️ Не удалось распознать ни одного названия");
+            return;
+        }
+    
+        WatchdogService.AddChannels(chls)
+        bot.sendMessage(ChatID, `✅ Добавлено ${chls.length} каналов в отслеживание`);
+    });
+});
+
 bot.onText(/\/start/, async (msg, match) => {
     const UserID = msg.from?.id;
     const ChatID = msg.chat.id;
@@ -397,7 +438,7 @@ bot.onText(/\/export$/, async (msg, match) => {
         }
 
         var str = "";
-        dead.forEach((x, i) => {str += `[${i}] ID: ${x.ChanelID} \t@${x.Name}\n`});
+        dead.forEach((x, i) => {str += `[${i}] \t@${x.username}\n`});
         writeFileSync('./result.txt', str, 'utf8');
         await bot.sendDocument(ChatID, './result.txt')
 
@@ -425,7 +466,7 @@ bot.onText(/\/exportall$/, async (msg, match) => {
         }
 
         var str = "";
-        dead.forEach((x, i) => {str += `[${i}] ID: ${x.ChanelID} \t@${x.Name}\n`});
+        dead.forEach((x, i) => {str += `[${i}] @${x.username}\n`});
         writeFileSync('./result.txt', str, 'utf8');
         await bot.sendDocument(ChatID, './result.txt')
 
@@ -440,36 +481,60 @@ bot.onText(/\/exportall$/, async (msg, match) => {
     }
 });
 
-bot.onText(/\/join/, async (msg, match) => {
+bot.onText(/\/add/, async (msg, match) => {
     const UserID = msg.from?.id;
     const ChatID = msg.chat.id;
     const AuthOK = await BotService.IsAuth(UserID);
 
-    if (AuthOK) {
-        var inputUsernames = (msg.text?.trim().split(' ').pop()?.replaceAll('@', '').replaceAll(' ', '').replaceAll(';', ',').replaceAll(':', ',').split(',')) || [];
-        if (inputUsernames.length <= 0) {
-            BotService.SendBadFormat(ChatID, UserID);
-            return;
-        }
-
-        let ok = 0;
-        for (let i = 0; i < inputUsernames.length; i++) {
-            try {
-                const resultJoin = await WatchdogService.JoinChannel(inputUsernames[i]);
-                const resultID = (await WatchdogService.ChannelIDChannel(inputUsernames[i])).chats[0].id;
-                
-                var ch = new Channel();
-                ch.SetID(resultID);
-                ch.Name = inputUsernames[i];
-                ChannelRepository.save(ch);
-
-                ok++;
-            } catch {}
-        }
-
-        bot.sendMessage(ChatID, `Вход в каналы:\n${ok}/${inputUsernames.length}`);
-    } else {
+    if (!AuthOK) {
         BotService.SendUnauthorized(ChatID, UserID);
         BotService.SetDefaultCommandSet(ChatID, UserID);
+        return;
     }
+
+    const input = ((msg.text?.trim().split(' ').pop() + " ").replaceAll('@', '').replaceAll(';', ' ').replaceAll(':', ' ').split(' ')) || [];
+    const chls: string[] = [];
+    input.forEach((x, i, a) => {
+        let usrn = x.toLowerCase().trim();
+        if (usrn == "") return;
+        chls.push(x.toLowerCase().trim())
+    });
+
+    if (chls.length <= 0) {
+        bot.sendMessage(ChatID, "❗️ Не удалось распознать ни одного названия");
+        return;
+    }
+
+    WatchdogService.AddChannels(chls)
+    bot.sendMessage(ChatID, `✅ Добавлено ${chls.length} каналов в отслеживание`);
+});
+
+bot.onText(/\/check/, async (msg, match) => {
+    const UserID = msg.from?.id;
+    const ChatID = msg.chat.id;
+    const AuthOK = await BotService.IsAuth(UserID);
+
+    if (!AuthOK) {
+        BotService.SendUnauthorized(ChatID, UserID);
+        BotService.SetDefaultCommandSet(ChatID, UserID);
+        return;
+    }
+
+    WatchdogService.StartCheck();
+    bot.sendMessage(ChatID, `✅ Проверка запущена!\nОтслеживается ${await ChannelRepository.countBy({ IsDead: false })} каналов`);
+});
+
+bot.onText(/\/wipe/, async (msg, match) => {
+    const UserID = msg.from?.id;
+    const ChatID = msg.chat.id;
+    const AuthOK = await BotService.IsAuth(UserID);
+
+    if (!AuthOK) {
+        BotService.SendUnauthorized(ChatID, UserID);
+        BotService.SetDefaultCommandSet(ChatID, UserID);
+        return;
+    }
+
+    await ChannelRepository.clear();
+    bot.sendMessage(ChatID, `♻️ Полная очистка`);
 });

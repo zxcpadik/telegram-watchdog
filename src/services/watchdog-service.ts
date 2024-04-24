@@ -7,6 +7,15 @@ import EventEmitter from "events";
 import { writeFileSync, readFileSync } from "fs";
 import { Channel } from "entity/chanel";
 
+export enum Status {
+  Idle = "Idle",
+  Active = "Active"
+}
+
+export async function Delay(ms: number) {
+  return new Promise((r) => setTimeout(() => { r(0) }, ms));
+}
+
 export module WatchdogService {
   const stringSession = new StringSession(readFileSync("./session", 'utf-8'));
   const client = new TelegramClient(stringSession, Number(process.env.TG_API_ID) || 0, process.env.TG_API_HASH || "", {
@@ -174,8 +183,7 @@ export module WatchdogService {
     var s = client.session.save() as unknown as string;
     if (s != "") {
       writeFileSync("./session", client.session.save() as unknown as string, 'utf8');
-      WatchdogLoop();
-      setInterval(WatchdogLoop, Number(process.env.CHECK_INTERVAL) * 1000);
+      setInterval(StartCheck, Number(process.env.CHECK_INTERVAL) * 1000);
       if (cChatID != -1) BotService.SendMessage(cChatID, "Успешная авторизация!");
     } else {
       if (cChatID != -1) BotService.SendMessage(cChatID, "Ошибка авторизации!");
@@ -183,59 +191,45 @@ export module WatchdogService {
     cChatID = -1;
   }
 
-  async function WatchdogLoop() {
-    try {
-      var channels = (await client.getDialogs()).filter((v) => v.isChannel == true);
-      var checking = await GetAliveChannels();
-      var markedIDs: Channel[] = [];
-
-      checking.forEach((check) => {
-        let ind = channels.findIndex((x) => { return (x.entity as Api.Channel).id == check.GetID() });
-        if (ind == -1) {
-          ChannelRepository.update({ ChanelID: check.ChanelID }, { IsDead: true, DieDate: new Date() });
-          markedIDs.push(check);
-        } else {
-          if (channels[ind] instanceof Api.ChannelForbidden) {
-            ChannelRepository.update({ ChanelID: check.ChanelID }, { IsDead: true, DieDate: new Date() });
-            markedIDs.push(check);
-          }
-        }
-      });
-
-      /*if (markedIDs.length > 0 && markedIDs.length <= 10) {
-        var str = "";
-        markedIDs.forEach((x) => {str += `\n@${x.Name} - ID-${x.ChanelID}`});
-
-        BotService.Broadcast(`⚠️ Отчет\nОтлетело ${markedIDs.length} каналов\n${str}`, BotService.ExportKeyboardConfig);
-      } else if (markedIDs.length > 10) {
-        BotService.Broadcast(`⚠️ Отчет\nОтлетело ${markedIDs.length} каналов`, BotService.ExportKeyboardConfig);
-      }*/
-      if (markedIDs.length > 0) {
-        BotService.Broadcast(`⚠️ Отчет\nОтлетело ${markedIDs.length} каналов\nИспользуйте /export`);
-      }
-    } catch (err) {
-      BotService.Broadcast("Ошибка сервиса!\nПроверь лог");
-      console.log("[ERROR] WatchdogService:WatchdogLoop");
-      console.log(err);
+  export function AddChannels(username: string[]) {
+    for (let x of username) {
+      ChannelRepository.save({ username: x, IsDead: false, Exported: false })
     }
   }
-
-  export function JoinChannel(username: string) {
-    return client.invoke(
-      new Api.channels.JoinChannel({
-        channel: username,
-      })
-    );
-  }
-  export function ChannelIDChannel(username: string) {
-    return client.invoke(
-      new Api.channels.GetChannels({
-        id: [username],
-      })
-    );
+  export async function TestChannel(username: string): Promise<boolean> {
+    try {
+      var ch = await client.getEntity(username);
+      if (ch instanceof Api.ChannelForbidden) return false;
+      return true;
+    } catch (err) { return false; }
   }
 
+  export var checkStatus: Status = Status.Idle;
+  export var checkProgress = 0;
+
+  export async function StartCheck() {
+    if (checkStatus != Status.Idle) return;
+    checkStatus = Status.Active;
+
+    var usernames = await ChannelRepository.findBy({ IsDead: false });
+    var dead = [];
+    if (usernames.length <= 0) {
+      checkStatus = Status.Idle;
+      return;
+    } 
+    for (let i = 0; i < usernames.length; i++) {
+      await Delay(7000);
+      if (!(await TestChannel(usernames[i].username))) dead.push(usernames[i]);
+      checkProgress = i / usernames.length;
+    }
+
+    dead.forEach(async (x) => await ChannelRepository.update({ username: x.username }, { IsDead: true }))
+    BotService.Broadcast(`👁‍🗨 Проверка завершена\nЖивые: ${await ChannelRepository.countBy({ IsDead: false })}\nМертвые: ${await ChannelRepository.countBy({ IsDead: true })}\nУмерло: ${dead.length}`);
+
+    checkStatus = Status.Idle;
+  }
   export function GetClientStatus() {
     return client.isUserAuthorized();
   }
 }
+

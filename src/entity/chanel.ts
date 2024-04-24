@@ -3,11 +3,8 @@ import { Entity, Column, PrimaryColumn } from "typeorm"
 
 @Entity()
 export class Channel {
-    @PrimaryColumn({type: 'bigint'})
-    ChanelID: string = "0";
-
-    @Column()
-    Name: string = "";
+    @PrimaryColumn()
+    username: string = "";
 
     @Column()
     IsDead: boolean = false;
@@ -17,11 +14,4 @@ export class Channel {
 
     @Column({ type: 'timestamptz', nullable: true })
     DieDate?: Date;
-
-    public GetID(): bigInt.BigInteger {
-        return bigInt(this.ChanelID);
-    }
-    public SetID(value: bigInt.BigInteger) {
-        this.ChanelID = value.toString();
-    }
 }

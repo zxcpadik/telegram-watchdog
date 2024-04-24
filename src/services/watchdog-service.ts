@@ -201,7 +201,13 @@ export module WatchdogService {
       var ch = await client.getEntity(username);
       if (ch instanceof Api.ChannelForbidden) return false;
       return true;
-    } catch (err) { return false; }
+    } catch (err) {
+      if (String(err).includes('flood')) {
+        console.log(`FLOOD skipped ${username}`);
+        return true;
+      }
+      return false;
+    }
   }
 
   export var checkStatus: Status = Status.Idle;
@@ -219,11 +225,13 @@ export module WatchdogService {
     } 
     for (let i = 0; i < usernames.length; i++) {
       await Delay(7000);
-      if (!(await TestChannel(usernames[i].username))) dead.push(usernames[i]);
+      if (!(await TestChannel(usernames[i].username))) {
+        await ChannelRepository.update({ username: usernames[i].username }, { IsDead: true })
+        dead.push(usernames[i]);
+      }
       checkProgress = i / usernames.length;
     }
 
-    dead.forEach(async (x) => await ChannelRepository.update({ username: x.username }, { IsDead: true }))
     BotService.Broadcast(`👁‍🗨 Проверка завершена\nЖивые: ${await ChannelRepository.countBy({ IsDead: false })}\nМертвые: ${await ChannelRepository.countBy({ IsDead: true })}\nУмерло: ${dead.length}`);
 
     checkStatus = Status.Idle;

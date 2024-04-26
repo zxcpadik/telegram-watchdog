@@ -202,7 +202,7 @@ export module WatchdogService {
       if (ch instanceof Api.ChannelForbidden) return false;
       return true;
     } catch (err) {
-      if (String(err).includes('flood')) {
+      if (String(err).toLowerCase().includes('flood')) {
         console.log(`FLOOD skipped ${username}`);
         return true;
       }

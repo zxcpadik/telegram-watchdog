@@ -1,11 +1,9 @@
 import TelegramBot from 'node-telegram-bot-api';
-import { AppDataSource, ChannelRepository, UserRepository } from './db-service';
+import { AppDataSource, ChannelRepository, ProxyRepo, UserRepository } from './db-service';
 import { Status, WatchdogService } from './watchdog-service';
 import { User } from '../entity/user';
 import { readFileSync, writeFileSync } from 'fs';
 import { Channel } from '../entity/chanel';
-import { Api } from 'telegram';
-import { randomUUID } from 'crypto';
 
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN || "", { polling: true });
 
@@ -27,9 +25,9 @@ export module BotService {
         { command: "/exportall", description: "Экспортировать все умершие каналы" },
         { command: "/cleardead", description: "Удалить все умершие каналы из проверки" },
         { command: "/add", description: "Добавить каналы в отслеживание" },
-        { command: "/pass", description: "Пароль для авторизации аккаунта (по необходимости)" },
-        { command: "/phone", description: "Телефон для авторизации аккаунта (по необходимости)" },
-        { command: "/code", description: "Код для для авторизации аккаунта (по необходимости)" },
+        { command: "/addproxy", description: "Добавить прокси (user:pass@ip:port списком)" },
+        { command: "/proxy", description: "Выводит кол-во прокси" },
+        { command: "/clearproxy", description: "Очистить все прокси" },
         { command: "/check", description: "Ручной запуск проверки" },
         { command: "/wipe", description: "Удаление всех каналов" },
     ];
@@ -94,9 +92,9 @@ export module BotService {
         if (ChatID == undefined || UserID == undefined) return false;
 
         try {
-            const Info = {total: await WatchdogService.GetTotalChannelsCount(), live: await WatchdogService.GetAliveChannelsCount(), dead: await WatchdogService.GetDeadChannelsCount(), authOK: await WatchdogService.GetClientStatus()};
-            var stat = `Проверка: ${WatchdogService.checkStatus == Status.Active ? `Активно (${(WatchdogService.checkProgress * 100).toFixed(1)}%)` : "Простой"}`;
-            bot.sendMessage(ChatID, `ChannelDetector\n\nВсего: ${Info.total}\nЖивые: ${Info.live}\nМертвые: ${Info.dead}\n\nВход: ${Info.authOK ? "🟢" : "🔴"}\n${stat}`);
+            const Info = await WatchdogService.getChannelsInfo();
+            var stat = `Проверка: ${WatchdogService.checkStatus == Status.Active ? `Активно (${(WatchdogService.stats.percent * 100).toFixed(1)}%)` : "Простой"}`;
+            bot.sendMessage(ChatID, `Channel Checker\n\nВсего: ${Info.total}\nЖивые: ${Info.alive}\nМертвые: ${Info.dead}\n${stat}`); // \n\nСтатус: ${WatchdogService.checkStatus == Status.Active ? `В процессе ()` : "🔴"}\n${stat}
             return true;
         } catch (err) {
             console.log("[ERROR] BotService:SendMenu");
@@ -360,57 +358,6 @@ bot.onText(/\/logout/, async (msg, match) => {
     }
 });
 
-bot.onText(/\/phone/, async (msg, match) => {
-    const UserID = msg.from?.id;
-    const ChatID = msg.chat.id;
-    const AuthOK = await BotService.IsAuth(UserID);
-
-    if (AuthOK) {
-        WatchdogService.cChatID = ChatID;
-        var InputPhone = msg.text?.trim().split(' ').pop();
-        if (InputPhone == undefined) {
-            BotService.SendBadFormat(ChatID, UserID);
-        } else WatchdogService.PassNumber(InputPhone);
-    } else {
-        BotService.SendUnauthorized(ChatID, UserID);
-        BotService.SetDefaultCommandSet(ChatID, UserID);
-    }
-});
-
-bot.onText(/\/code/, async (msg, match) => {
-    const UserID = msg.from?.id;
-    const ChatID = msg.chat.id;
-    const AuthOK = await BotService.IsAuth(UserID);
-
-    if (AuthOK) {
-        WatchdogService.cChatID = ChatID;
-        var InputCode = msg.text?.trim().split(' ').pop();
-        if (InputCode == undefined) {
-            BotService.SendBadFormat(ChatID, UserID);
-        } else WatchdogService.PassCode(InputCode);
-    } else {
-        BotService.SendUnauthorized(ChatID, UserID);
-        BotService.SetDefaultCommandSet(ChatID, UserID);
-    }
-});
-
-bot.onText(/\/pass/, async (msg, match) => {
-    const UserID = msg.from?.id;
-    const ChatID = msg.chat.id;
-    const AuthOK = await BotService.IsAuth(UserID);
-
-    if (AuthOK) {
-        WatchdogService.cChatID = ChatID;
-        var InputPass = msg.text?.trim().split(' ').pop();
-        if (InputPass == undefined) {
-            BotService.SendBadFormat(ChatID, UserID);
-        } else WatchdogService.PassPassword(InputPass);
-    } else {
-        BotService.SendUnauthorized(ChatID, UserID);
-        BotService.SetDefaultCommandSet(ChatID, UserID);
-    }
-});
-
 bot.onText(/\/cleardead/, async (msg, match) => {
     const UserID = msg.from?.id;
     const ChatID = msg.chat.id;
@@ -481,7 +428,7 @@ bot.onText(/\/exportall$/, async (msg, match) => {
     }
 });
 
-bot.onText(/\/add/, async (msg, match) => {
+bot.onText(/\/add\\s*/, async (msg, match) => {
     const UserID = msg.from?.id;
     const ChatID = msg.chat.id;
     const AuthOK = await BotService.IsAuth(UserID);
@@ -537,4 +484,60 @@ bot.onText(/\/wipe/, async (msg, match) => {
 
     await ChannelRepository.clear();
     bot.sendMessage(ChatID, `♻️ Полная очистка`);
+});
+
+bot.onText(/\/addproxy/, async (msg, match) => {
+    const UserID = msg.from?.id;
+    const ChatID = msg.chat.id;
+    const AuthOK = await BotService.IsAuth(UserID);
+
+    if (!AuthOK) {
+        BotService.SendUnauthorized(ChatID, UserID);
+        BotService.SetDefaultCommandSet(ChatID, UserID);
+        return;
+    }
+
+    var added = 0;
+    try {
+        var text = msg.text?.split(' ')[1];
+        var inps = text?.split('\n');
+        if (inps) {
+            var prox = await WatchdogService.parseProxy(inps);
+            for (let p of prox) { (await ProxyRepo.save(p)); added++; }
+        }
+    } catch {}
+
+    bot.sendMessage(ChatID, `Добавлено ${added} прокси`);
+});
+
+bot.onText(/\/proxy/, async (msg, match) => {
+    const UserID = msg.from?.id;
+    const ChatID = msg.chat.id;
+    const AuthOK = await BotService.IsAuth(UserID);
+
+    if (!AuthOK) {
+        BotService.SendUnauthorized(ChatID, UserID);
+        BotService.SetDefaultCommandSet(ChatID, UserID);
+        return;
+    }
+
+    var proxy = await ProxyRepo.count();
+
+    bot.sendMessage(ChatID, `Всего ${proxy} прокси`);
+});
+
+bot.onText(/\/clearproxy/, async (msg, match) => {
+    const UserID = msg.from?.id;
+    const ChatID = msg.chat.id;
+    const AuthOK = await BotService.IsAuth(UserID);
+
+    if (!AuthOK) {
+        BotService.SendUnauthorized(ChatID, UserID);
+        BotService.SetDefaultCommandSet(ChatID, UserID);
+        return;
+    }
+
+    await ProxyRepo.clear();
+
+    bot.sendMessage(ChatID, `Все прокси очищенны`);
 });

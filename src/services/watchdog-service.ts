@@ -1,15 +1,23 @@
-import { StoreSession } from "telegram/sessions";
-import { ChannelRepository } from "./db-service";
-import { Api, TelegramClient } from "telegram";
-import { StringSession } from "telegram/sessions";
+import { ChannelRepository, ProxyRepo } from "./db-service";
 import { BotService } from "./bot-service";
 import EventEmitter from "events";
-import { writeFileSync, readFileSync } from "fs";
-import { Channel } from "entity/chanel";
+import { writeFileSync, readFileSync, stat } from "fs";
+import * as https from 'https';
+import * as cheerio from 'cheerio';
+import { getRandom } from 'random-useragent';
+import { Proxy } from "../entity/proxy";
 
 export enum Status {
   Idle = "Idle",
   Active = "Active"
+}
+
+export class ChannelsInfo {
+  total: number = 0;
+  dead: number = 0;
+  alive: number = 0;
+  exported: number = 0;
+  unexported: number = 0;
 }
 
 export async function Delay(ms: number) {
@@ -17,39 +25,18 @@ export async function Delay(ms: number) {
 }
 
 export module WatchdogService {
-  const stringSession = new StringSession(readFileSync("./session", 'utf-8'));
-  const client = new TelegramClient(stringSession, Number(process.env.TG_API_ID) || 0, process.env.TG_API_HASH || "", {
-    connectionRetries: 5
-  });
-  const events = new EventEmitter();
-  export var cChatID: number = -1;
+  export const stats = { total: 0, inprogress: 0, done: 0, error: 0, percent: 0};
 
-  export async function GetTotalChannelsCount() {
-    try {
-      return await ChannelRepository.count();
-    } catch (err) {
-      console.log("[ERROR] WatchdogService:GetTotalChannelsCount");
-      console.log(err);
-      return -1;
-    }
-  }
-  export async function GetAliveChannelsCount() {
-    try {
-      return await ChannelRepository.countBy({IsDead: false});
-    } catch (err) {
-      console.log("[ERROR] WatchdogService:GetAliveChannelsCount");
-      console.log(err);
-      return -1;
-    }
-  }
-  export async function GetDeadChannelsCount() {
-    try {
-      return await ChannelRepository.countBy({IsDead: true});
-    } catch (err) {
-      console.log("[ERROR] WatchdogService:GetDeadChannelsCount");
-      console.log(err);
-      return -1;
-    }
+  export async function getChannelsInfo() {
+    const stats = new ChannelsInfo();
+
+    stats.total = await ChannelRepository.count();
+    stats.alive = await ChannelRepository.countBy({ IsDead: false });
+    stats.dead = await ChannelRepository.countBy({ IsDead: true });
+    stats.exported = await ChannelRepository.countBy({ Exported: true });
+    stats.unexported = await ChannelRepository.countBy({ Exported: false });
+
+    return stats;
   }
   export async function ClearAll() {
     try {
@@ -106,6 +93,7 @@ export module WatchdogService {
       return [];
     }
   }
+
   export async function GetDeadUnexportChannels() {
     try {
       return await ChannelRepository.findBy({IsDead: true, Exported: false});
@@ -126,118 +114,104 @@ export module WatchdogService {
     }
   }
 
-  export function PassNumber(number: string) {
-    return events.emit("phone", number);
-  }
-  export function PassPassword(password: string) {
-    return events.emit("password", password);
-  }
-  export function PassCode(code: string) {
-    return events.emit("code", code);
-  }
-
-  export function RequestNumber() {
-    BotService.Broadcast("Необходима авторизация клиента!\n/phone [номер]");
-    return new Promise<string>((resolve) => {
-      events.once("phone", (phone: string) => {
-        return resolve(phone);
-      });
-    });
-  }
-  export function RequestPassword() {
-    if (cChatID != -1) {
-      BotService.SendMessage(cChatID, "Введите пароль\n/pass");
-    }
-    return new Promise<string>((resolve) => {
-      events.once("password", (phone: string) => {
-        return resolve(phone);
-      });
-    });
-  }
-  export function RequestCode() {
-    return new Promise<string>((resolve) => {
-      console.log("BREAK0");
-      if (cChatID != -1) {
-        BotService.SendMessage(cChatID, "Введите код\n/code");
-      }
-      console.log("BREAK1");
-      events.once("code", (phone: string) => {
-        console.log(`\"${phone}\"`);
-        return resolve(phone);
-      });
-    });
-  }
-
-  export async function InitClient() {
-    await client.start({
-      phoneNumber: () => RequestNumber(),
-      password: () => RequestPassword(),
-      phoneCode: () => RequestCode(),
-      onError: (err) => {
-        BotService.Broadcast("Ошибка клиента!\nПроверь лог");
-        console.log("[ERROR] WatchdogService:Client -> onError");
-        console.log(err);
-      }
-    });
-
-    var s = client.session.save() as unknown as string;
-    if (s != "") {
-      writeFileSync("./session", client.session.save() as unknown as string, 'utf8');
-      setInterval(StartCheck, Number(process.env.CHECK_INTERVAL) * 1000);
-      if (cChatID != -1) BotService.SendMessage(cChatID, "Успешная авторизация!");
-    } else {
-      if (cChatID != -1) BotService.SendMessage(cChatID, "Ошибка авторизации!");
-    }
-    cChatID = -1;
-  }
-
   export function AddChannels(username: string[]) {
     for (let x of username) {
       ChannelRepository.save({ username: x, IsDead: false, Exported: false })
     }
   }
-  export async function TestChannel(username: string): Promise<boolean> {
-    try {
-      var ch = await client.getEntity(username);
-      if (ch instanceof Api.ChannelForbidden) return false;
-      return true;
-    } catch (err) {
-      if (String(err).toLowerCase().includes('flood')) {
-        console.log(`FLOOD skipped ${username}`);
-        return true;
+
+  export async function parseProxy(proxies: string[]) {
+    const proxyList: Proxy[] = proxies.map((proxy) => {
+      const [username, password] = proxy.split('@')[0].split(':');
+      const [ip, port] = proxy.split('@')[1].split(':');
+      let p = new Proxy();
+      p.ip = ip;
+      p.password = password;
+      p.port = parseInt(port, 10);
+      p.username = username;
+      return p;
+    });
+    return proxyList;
+  }
+  // username: without @
+  // proxy: user:pass@ip:port
+  async function performCheck(nicknames: string[], proxies: Proxy[]): Promise<{ [username: string]: boolean | null }> {
+    stats.total = nicknames.length;
+    stats.inprogress = nicknames.length;
+    var results: { [username: string]: boolean | null } = {};
+
+    for (const nickname of nicknames) {
+      try {
+        const proxy = proxies[Math.floor(Math.random() * proxies.length)];
+        const userAgent = getRandom();
+        const options = {
+          method: 'GET',
+          hostname: 't.me',
+          path: `/${nickname}`,
+          headers: {
+            'User-Agent': userAgent,
+          },
+          auth: `${proxy.username}:${proxy.password}`,
+        };
+
+        await new Promise((resolve) => setTimeout(resolve, 250));
+
+        const req = https.request(options, (res) => {
+          if (res.statusCode === 200) {
+            var html = '';
+            res.on('data', (chunk) => {
+              html += chunk;
+            });
+            res.on('end', () => {
+              var $ = cheerio.load(html);
+              results[nickname] = $('body:contains("Preview channel")').length > 0;
+            });
+          } else {
+            results[nickname] = null;
+          }
+        });
+
+        req.on('error', () => {
+          results[nickname] = null;
+          stats.error++;
+        });
+
+        req.end();
+      } catch (error) {
+        console.log(`Error checking ${nickname}: ${(error as Error).message}`);
+        results[nickname] = null;
+        stats.error++;
       }
-      return false;
+      stats.inprogress--;
+      stats.done++;
+
+      stats.percent = stats.done / stats.total;
     }
+
+    return results;
   }
 
   export var checkStatus: Status = Status.Idle;
-  export var checkProgress = 0;
-
   export async function StartCheck() {
     if (checkStatus != Status.Idle) return;
     checkStatus = Status.Active;
 
-    var usernames = await ChannelRepository.findBy({ IsDead: false });
-    var dead = [];
-    if (usernames.length <= 0) {
-      checkStatus = Status.Idle;
-      return;
-    } 
-    for (let i = 0; i < usernames.length; i++) {
-      await Delay(7000);
-      if (!(await TestChannel(usernames[i].username))) {
-        await ChannelRepository.update({ username: usernames[i].username }, { IsDead: true })
-        dead.push(usernames[i]);
-      }
-      checkProgress = i / usernames.length;
+    var usernames = (await ChannelRepository.findBy({ IsDead: false })).map(el => el.username);
+    var proxies = await ProxyRepo.find();
+    var result = await performCheck(usernames, proxies);
+
+    var ents = Object.entries(result);
+    var err = 0;
+    var dead = 0;
+    for (var el of ents) {
+      await ChannelRepository.update({ username: el[0] }, { IsDead: el[1] === false });
+      err += el[1] === null ? 1 : 0;
+      dead += el[1] === false ? 1 : 0;
     }
 
-    BotService.Broadcast(`👁‍🗨 Проверка завершена\nЖивые: ${await ChannelRepository.countBy({ IsDead: false })}\nМертвые: ${await ChannelRepository.countBy({ IsDead: true })}\nУмерло: ${dead.length}`);
+    var stats = await getChannelsInfo();
+    BotService.Broadcast(`👁‍🗨 Проверка завершена\nЖивые: ${stats.alive}\nМертвые: ${stats.dead}\nУмерло: ${dead}\nОшибка: ${err}`);
 
     checkStatus = Status.Idle;
   }
-  export function GetClientStatus() {
-    return client.isUserAuthorized();
-  }
 }
-

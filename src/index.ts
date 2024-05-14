@@ -29,4 +29,3 @@ import "reflect-metadata";
 import { WatchdogService } from "./services/watchdog-service";
 
 //setTimeout(() => { BotService.Broadcast("Script running") }, 1000);
-setTimeout(async () => { await WatchdogService.InitClient() }, 0);
